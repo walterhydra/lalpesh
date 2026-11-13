@@ -8,9 +8,40 @@ const db = require('./db');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Enable proxy trusting for Vercel and reverse proxies
+app.set('trust proxy', 1);
+
 // User Credentials requested
 const AUTH_EMAIL = '123@gmail.com';
 const AUTH_PASSWORD = '123';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'lalpesh-notes-secret-key-2026';
+
+// Stateless HMAC Session helpers (works 100% reliably across serverless lambdas)
+function createSignedToken(email) {
+  const payload = {
+    email: email.toLowerCase(),
+    exp: Date.now() + 30 * 24 * 60 * 60 * 1000 // 30 days
+  };
+  const data = Buffer.from(JSON.stringify(payload)).toString('base64url');
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  return `${data}.${sig}`;
+}
+
+function verifySignedToken(token) {
+  if (!token || typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 2) return false;
+  const [data, sig] = parts;
+  const expectedSig = crypto.createHmac('sha256', SESSION_SECRET).update(data).digest('base64url');
+  if (sig !== expectedSig) return false;
+  try {
+    const payload = JSON.parse(Buffer.from(data, 'base64url').toString('utf8'));
+    if (!payload.exp || Date.now() > payload.exp) return false;
+    return payload.email === AUTH_EMAIL.toLowerCase();
+  } catch (e) {
+    return false;
+  }
+}
 
 // Memory storage for file uploads (serverless & cloud-ready, zero disk permission issues)
 const storage = multer.memoryStorage();
@@ -31,7 +62,7 @@ app.use(express.static(path.join(__dirname, 'public'), { index: false }));
 function isAuthenticated(req) {
   const token = req.cookies['note_session'];
   if (!token) return false;
-  return db.validateSession(token);
+  return verifySignedToken(token);
 }
 
 // Auth middleware for API routes
@@ -60,23 +91,28 @@ app.get('/login', (req, res) => {
 });
 
 app.post('/api/login', (req, res) => {
-  const { email, password } = req.body;
+  const email = (req.body.email || '').trim().toLowerCase();
+  const password = (req.body.password || '').trim();
+
   if (!email || !password) {
     return res.status(400).json({ error: 'Please provide both email and password.' });
   }
 
-  if (email.trim().toLowerCase() === AUTH_EMAIL.toLowerCase() && password === AUTH_PASSWORD) {
-    const token = crypto.randomBytes(32).toString('hex');
-    const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-    db.createSession(token, AUTH_EMAIL, expiresAt);
+  if (email === AUTH_EMAIL.toLowerCase() && password === AUTH_PASSWORD) {
+    const token = createSignedToken(email);
 
     res.cookie('note_session', token, {
       httpOnly: true,
       maxAge: 30 * 24 * 60 * 60 * 1000,
+      path: '/',
       sameSite: 'lax',
       secure: process.env.NODE_ENV === 'production'
     });
+
+    // Check if request is standard form submission
+    if (req.headers['accept'] && !req.headers['accept'].includes('application/json')) {
+      return res.redirect('/');
+    }
 
     return res.json({ success: true, message: 'Logged in successfully.' });
   }
@@ -85,11 +121,7 @@ app.post('/api/login', (req, res) => {
 });
 
 app.post('/api/logout', (req, res) => {
-  const token = req.cookies['note_session'];
-  if (token) {
-    db.deleteSession(token);
-  }
-  res.clearCookie('note_session');
+  res.clearCookie('note_session', { path: '/' });
   res.json({ success: true });
 });
 
